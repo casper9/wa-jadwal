@@ -84,6 +84,14 @@ function accountSessionDir(accountId) {
   return path.join(__dirname, ".wwebjs_auth", `session-wa_${accountId}`);
 }
 
+// ---------- keyword match ----------
+function containsKeyword(text, keyword) {
+  const t = String(text || "").toLowerCase();
+  const k = String(keyword || "").trim().toLowerCase();
+  if (!k) return false;
+  return t.includes(k);
+}
+
 // ---------- parsing per-target message ----------
 // per line formats:
 // 1) target
@@ -148,7 +156,7 @@ function buildScheduleSpec(datetimeISO, repeatType, intervalValue) {
   if (repeatType === "interval_minutes") return { kind: "cron", value: `${sec} */${n} * * * *` };
   if (repeatType === "interval_hours") return { kind: "cron", value: `${sec} ${minute} */${n} * * *` };
 
-  // Simple day-of-month step (bisa “lompat” di bulan yang jumlah harinya beda)
+  // Simple day-of-month step (bisa “lompat” saat beda jumlah hari di bulan)
   if (repeatType === "interval_days") return { kind: "cron", value: `${sec} ${minute} ${hour} */${n} * *` };
 
   // Simple bulan: tanggal sama (dom) tiap N bulan
@@ -221,6 +229,7 @@ function saveRecent(accountId, recentObj) {
   atomicWriteJson(recentFile(accountId), recentObj);
 }
 
+// store recent targets lines + default message
 function updateRecent(accountId, targetsText, defaultMessage) {
   const rec = loadRecent(accountId);
 
@@ -246,6 +255,21 @@ function updateRecent(accountId, targetsText, defaultMessage) {
 }
 
 // ---------- multi account manager ----------
+/**
+Schedule item:
+{
+  id,
+  targets: [{target,message}],
+  targetsText,
+  defaultMessage,
+  datetimeISO,
+  repeatType, intervalMinutes,
+  repeatUntilISO?, remainingCount?,
+  windowStart?, windowEnd?,
+  gapSeconds?, randomDelayMinSeconds?, randomDelayMaxSeconds?,
+  stopOnReplyKeyword?   // ✅ stop repeat if incoming reply contains this keyword
+}
+**/
 const accounts = {};
 
 function ensureAccount(accountId) {
@@ -302,6 +326,47 @@ function ensureAccount(accountId) {
     rescheduleAll(accountId);
   });
 
+  // ✅ STOP repeat jika ada balasan masuk dari target yg mengandung keyword
+  client.on("message", async (msg) => {
+    try {
+      if (!msg) return;
+      if (msg.fromMe) return;
+
+      const fromChatId = String(msg.from || "");
+      const body = String(msg.body || "");
+
+      // loop copy agar aman saat splice
+      for (const item of acc.messages.slice()) {
+        const keyword = item.stopOnReplyKeyword;
+        if (!keyword) continue;
+
+        const targets = Array.isArray(item.targets) ? item.targets : [];
+        const hit = targets.some((t) => toChatId(t.target) === fromChatId);
+        if (!hit) continue;
+
+        if (!containsKeyword(body, keyword)) continue;
+
+        console.log(
+          `[${accountId}] STOP repeat id=${item.id} (reply contains "${keyword}") from ${fromChatId}`
+        );
+
+        // cancel job + remove schedule
+        try {
+          acc.jobs[item.id]?.cancel();
+        } catch {}
+        delete acc.jobs[item.id];
+
+        const idx = acc.messages.findIndex((m) => m.id === item.id);
+        if (idx !== -1) {
+          acc.messages.splice(idx, 1);
+          saveMessages(accountId);
+        }
+      }
+    } catch (e) {
+      console.log(`[${accountId}] message handler error:`, e);
+    }
+  });
+
   client.initialize();
   acc.client = client;
 
@@ -316,7 +381,9 @@ function saveMessages(accountId) {
 
 function cancelAllJobs(acc) {
   for (const id of Object.keys(acc.jobs)) {
-    try { acc.jobs[id].cancel(); } catch {}
+    try {
+      acc.jobs[id].cancel();
+    } catch {}
     delete acc.jobs[id];
   }
 }
@@ -335,7 +402,9 @@ async function runQueue(accountId) {
 
   while (acc.sendQueue.length > 0) {
     const task = acc.sendQueue.shift();
-    try { await task(); } catch (e) {
+    try {
+      await task();
+    } catch (e) {
       console.log(`[${accountId}] Queue task failed:`, e);
     }
   }
@@ -346,12 +415,18 @@ async function sendTargetsPerItem(accountId, item) {
   const acc = ensureAccount(accountId);
 
   const list = Array.isArray(item.targets) ? item.targets : [];
-  const gapSec = Number.isFinite(Number(item.gapSeconds)) ? Math.max(0, Math.floor(Number(item.gapSeconds))) : 2;
-  const rMin = Number.isFinite(Number(item.randomDelayMinSeconds)) ? Math.max(0, Math.floor(Number(item.randomDelayMinSeconds))) : 0;
-  const rMax = Number.isFinite(Number(item.randomDelayMaxSeconds)) ? Math.max(0, Math.floor(Number(item.randomDelayMaxSeconds))) : 0;
+  const gapSec = Number.isFinite(Number(item.gapSeconds))
+    ? Math.max(0, Math.floor(Number(item.gapSeconds)))
+    : 2;
+  const rMin = Number.isFinite(Number(item.randomDelayMinSeconds))
+    ? Math.max(0, Math.floor(Number(item.randomDelayMinSeconds)))
+    : 0;
+  const rMax = Number.isFinite(Number(item.randomDelayMaxSeconds))
+    ? Math.max(0, Math.floor(Number(item.randomDelayMaxSeconds)))
+    : 0;
 
   for (const t of list) {
-    const jitter = (rMax > 0 || rMin > 0) ? randInt(rMin, rMax) : 0;
+    const jitter = rMax > 0 || rMin > 0 ? randInt(rMin, rMax) : 0;
     if (jitter > 0) await sleep(jitter * 1000);
 
     const chatId = toChatId(t.target);
@@ -372,7 +447,9 @@ function afterSendUpdate(accountId, id) {
   if ((cur.repeatType || "once") === "once") {
     acc.messages.splice(idx, 1);
     saveMessages(accountId);
-    try { acc.jobs[id]?.cancel(); } catch {}
+    try {
+      acc.jobs[id]?.cancel();
+    } catch {}
     delete acc.jobs[id];
     return;
   }
@@ -382,7 +459,9 @@ function afterSendUpdate(accountId, id) {
     if (cur.remainingCount <= 0) {
       acc.messages.splice(idx, 1);
       saveMessages(accountId);
-      try { acc.jobs[id]?.cancel(); } catch {}
+      try {
+        acc.jobs[id]?.cancel();
+      } catch {}
       delete acc.jobs[id];
       return;
     }
@@ -396,7 +475,9 @@ function scheduleOne(accountId, item) {
   if (!isValidDateString(datetimeISO)) return;
 
   if (acc.jobs[id]) {
-    try { acc.jobs[id].cancel(); } catch {}
+    try {
+      acc.jobs[id].cancel();
+    } catch {}
     delete acc.jobs[id];
   }
 
@@ -414,7 +495,9 @@ function scheduleOne(accountId, item) {
       // until
       if (current.repeatUntilISO && isValidDateString(current.repeatUntilISO)) {
         if (Date.now() > new Date(current.repeatUntilISO).getTime()) {
-          try { acc.jobs[id]?.cancel(); } catch {}
+          try {
+            acc.jobs[id]?.cancel();
+          } catch {}
           delete acc.jobs[id];
           acc.messages.splice(idx, 1);
           saveMessages(accountId);
@@ -424,7 +507,9 @@ function scheduleOne(accountId, item) {
 
       // count
       if (typeof current.remainingCount === "number" && current.remainingCount <= 0) {
-        try { acc.jobs[id]?.cancel(); } catch {}
+        try {
+          acc.jobs[id]?.cancel();
+        } catch {}
         delete acc.jobs[id];
         acc.messages.splice(idx, 1);
         saveMessages(accountId);
@@ -589,6 +674,7 @@ app.post("/accounts/:accountId/messages", (req, res) => {
     gapSeconds,
     randomDelayMinSeconds,
     randomDelayMaxSeconds,
+    stopOnReplyKeyword, // ✅ NEW
   } = req.body;
 
   if (!targetsText || !datetimeISO) {
@@ -637,9 +723,16 @@ app.post("/accounts/:accountId/messages", (req, res) => {
   }
 
   const gap = gapSeconds !== undefined && gapSeconds !== "" ? Math.max(0, Math.floor(Number(gapSeconds))) : 2;
-  const rMin = randomDelayMinSeconds !== undefined && randomDelayMinSeconds !== "" ? Math.max(0, Math.floor(Number(randomDelayMinSeconds))) : 0;
-  const rMax = randomDelayMaxSeconds !== undefined && randomDelayMaxSeconds !== "" ? Math.max(0, Math.floor(Number(randomDelayMaxSeconds))) : 0;
+  const rMin =
+    randomDelayMinSeconds !== undefined && randomDelayMinSeconds !== ""
+      ? Math.max(0, Math.floor(Number(randomDelayMinSeconds)))
+      : 0;
+  const rMax =
+    randomDelayMaxSeconds !== undefined && randomDelayMaxSeconds !== ""
+      ? Math.max(0, Math.floor(Number(randomDelayMaxSeconds)))
+      : 0;
 
+  const keyword = String(stopOnReplyKeyword || "").trim();
   const item = {
     id: Date.now(),
     targets,
@@ -650,6 +743,10 @@ app.post("/accounts/:accountId/messages", (req, res) => {
     intervalMinutes: interval, // interval value (N)
     repeatUntilISO: until,
     remainingCount,
+
+    // ✅ stop repeat if incoming reply contains this
+    stopOnReplyKeyword: keyword ? keyword : undefined,
+
     windowStart: windowStart || undefined,
     windowEnd: windowEnd || undefined,
     gapSeconds: gap,
@@ -661,6 +758,7 @@ app.post("/accounts/:accountId/messages", (req, res) => {
   saveMessages(accountId);
   if (acc.ready) scheduleOne(accountId, item);
 
+  // update recent automatically
   updateRecent(accountId, item.targetsText, item.defaultMessage);
 
   res.json({ ok: true, item });
@@ -742,8 +840,16 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
   if (patch.windowEnd !== undefined) cur.windowEnd = patch.windowEnd || undefined;
 
   if (patch.gapSeconds !== undefined) cur.gapSeconds = Math.max(0, Math.floor(Number(patch.gapSeconds || 2)));
-  if (patch.randomDelayMinSeconds !== undefined) cur.randomDelayMinSeconds = Math.max(0, Math.floor(Number(patch.randomDelayMinSeconds || 0)));
-  if (patch.randomDelayMaxSeconds !== undefined) cur.randomDelayMaxSeconds = Math.max(0, Math.floor(Number(patch.randomDelayMaxSeconds || 0)));
+  if (patch.randomDelayMinSeconds !== undefined)
+    cur.randomDelayMinSeconds = Math.max(0, Math.floor(Number(patch.randomDelayMinSeconds || 0)));
+  if (patch.randomDelayMaxSeconds !== undefined)
+    cur.randomDelayMaxSeconds = Math.max(0, Math.floor(Number(patch.randomDelayMaxSeconds || 0)));
+
+  // ✅ NEW: keyword update
+  if (patch.stopOnReplyKeyword !== undefined) {
+    const k = String(patch.stopOnReplyKeyword || "").trim();
+    cur.stopOnReplyKeyword = k ? k : undefined;
+  }
 
   // guard: interval_* harus punya intervalMinutes >=1
   if (String(cur.repeatType || "").startsWith("interval_")) {
@@ -754,11 +860,14 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
   saveMessages(accountId);
 
   if (acc.jobs[id]) {
-    try { acc.jobs[id].cancel(); } catch {}
+    try {
+      acc.jobs[id].cancel();
+    } catch {}
     delete acc.jobs[id];
   }
   if (acc.ready) scheduleOne(accountId, cur);
 
+  // update recent automatically
   updateRecent(accountId, cur.targetsText || "", cur.defaultMessage || "");
 
   res.json({ ok: true, item: cur });
@@ -773,7 +882,9 @@ app.delete("/accounts/:accountId/messages/:id", (req, res) => {
   if (idx === -1) return res.status(404).json({ error: "not found" });
 
   if (acc.jobs[id]) {
-    try { acc.jobs[id].cancel(); } catch {}
+    try {
+      acc.jobs[id].cancel();
+    } catch {}
     delete acc.jobs[id];
   }
 
@@ -790,7 +901,9 @@ app.post("/accounts/:accountId/logout", async (req, res) => {
 
   try {
     cancelAllJobs(acc);
-    try { await acc.client.logout(); } catch {}
+    try {
+      await acc.client.logout();
+    } catch {}
 
     // ✅ remove session folder safely
     removeDirSafe(accountSessionDir(accountId));
@@ -812,15 +925,23 @@ app.delete("/accounts/:accountId", async (req, res) => {
   try {
     if (acc) {
       cancelAllJobs(acc);
-      try { await acc.client.destroy(); } catch {}
-      try { await acc.client.logout(); } catch {}
+      try {
+        await acc.client.destroy();
+      } catch {}
+      try {
+        await acc.client.logout();
+      } catch {}
     }
 
     // ✅ remove session folder safely
     removeDirSafe(accountSessionDir(accountId));
 
-    try { fs.unlinkSync(path.join(DATA_DIR, `scheduledMessages.${accountId}.json`)); } catch {}
-    try { fs.unlinkSync(recentFile(accountId)); } catch {}
+    try {
+      fs.unlinkSync(path.join(DATA_DIR, `scheduledMessages.${accountId}.json`));
+    } catch {}
+    try {
+      fs.unlinkSync(recentFile(accountId));
+    } catch {}
 
     delete accounts[accountId];
 
