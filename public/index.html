@@ -23,7 +23,7 @@
 </head>
 <body>
 
-<h2>📅 WA Scheduler (Pesan per Target + Auto Recent)</h2>
+<h2>📅 WA Scheduler (Pesan per Target + Auto Recent + Stop on Reply)</h2>
 
 <div class="box">
   <h3>1) Akun</h3>
@@ -114,6 +114,10 @@
     <input id="intervalMinutes" type="number" min="1" value="5">
     <div class="small">Dipakai untuk semua interval (detik/menit/jam/hari/bulan).</div>
   </div>
+
+  <label>Stop Repeat jika target membalas mengandung teks ini (opsional)</label>
+  <input id="stopOnReplyKeyword" placeholder="contoh: SUDAH / STOP / DONE">
+  <div class="small">Jika target (chat yang sama) membalas dan mengandung keyword ini, jadwal otomatis berhenti & terhapus.</div>
 
   <h4>Anti-Spam</h4>
   <div class="row">
@@ -358,7 +362,7 @@ function repeatLabel(m){
   if (rt === 'weekly') return 'Mingguan';
   if (rt === 'monthly') return 'Bulanan';
 
-  const n = m.intervalMinutes || 1; // interval value
+  const n = m.intervalMinutes || 1;
   if (rt === 'interval_seconds') return `Tiap ${n} detik`;
   if (rt === 'interval_minutes') return `Tiap ${n} menit`;
   if (rt === 'interval_hours') return `Tiap ${n} jam`;
@@ -376,7 +380,9 @@ async function createMsg(){
     datetimeISO: toISOFromLocal(document.getElementById('datetime').value),
 
     repeatType: document.getElementById('repeatType').value,
-    intervalMinutes: document.getElementById('intervalMinutes').value, // interval value
+    intervalMinutes: document.getElementById('intervalMinutes').value,
+
+    stopOnReplyKeyword: document.getElementById('stopOnReplyKeyword').value.trim() || undefined,
 
     repeatCount: document.getElementById('repeatCount').value || undefined,
     repeatUntilISO: toISOFromLocal(document.getElementById('repeatUntil').value) || undefined,
@@ -400,6 +406,9 @@ async function createMsg(){
   });
 
   if (!r.ok) return alert('Gagal: ' + await r.text());
+
+  // reset kecil
+  document.getElementById('stopOnReplyKeyword').value = '';
 
   await loadMessages();
   await refreshStatus();
@@ -431,6 +440,7 @@ async function loadMessages(){
       <span class="small">Start: ${new Date(m.datetimeISO).toLocaleString()}</span><br>
       ${m.repeatUntilISO ? `<span class="small">Until: ${new Date(m.repeatUntilISO).toLocaleString()}</span><br>` : ``}
       ${typeof m.remainingCount === 'number' ? `<span class="small">Remaining: ${m.remainingCount}</span><br>` : ``}
+      ${m.stopOnReplyKeyword ? `<span class="small">Stop on Reply: <code>${escapeHtml(m.stopOnReplyKeyword)}</code></span><br>` : ``}
       <span class="small">Window: ${escapeHtml(m.windowStart || '-')} - ${escapeHtml(m.windowEnd || '-')}</span><br>
       <span class="small">Gap: ${m.gapSeconds}s | Random: ${m.randomDelayMinSeconds}-${m.randomDelayMaxSeconds}s</span>
 
@@ -466,8 +476,10 @@ async function loadMessages(){
         <div id="ibox_${m.id}" style="display:none">
           <label>Interval (N)</label>
           <input id="im_${m.id}" type="number" min="1" value="${m.intervalMinutes || 5}">
-          <div class="small">Dipakai untuk semua interval.</div>
         </div>
+
+        <label>Stop Repeat jika ada balasan mengandung teks ini (opsional)</label>
+        <input id="sk_${m.id}" value="${escapeHtml(m.stopOnReplyKeyword || '')}" placeholder="contoh: SUDAH / STOP / DONE">
 
         <h4>Window & Delay</h4>
         <div class="row">
@@ -536,6 +548,8 @@ async function editMsg(id){
 
     repeatType: document.getElementById(`rt_${id}`).value,
     intervalMinutes: document.getElementById(`im_${id}`)?.value,
+
+    stopOnReplyKeyword: document.getElementById(`sk_${id}`).value.trim() || "",
 
     repeatCount: document.getElementById(`rc_${id}`).value || "",
     repeatUntilISO: toISOFromLocal(document.getElementById(`ru_${id}`).value) || "",
