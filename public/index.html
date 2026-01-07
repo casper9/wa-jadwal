@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>WA Scheduler</title>
+  <style>
+    body{font-family:Arial,sans-serif;background:#f5f6f8;padding:20px}
+    .box{background:#fff;padding:14px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:14px}
+    input,textarea,button,select{width:100%;padding:8px;margin-top:6px;margin-bottom:10px}
+    button{background:#25D366;color:#fff;border:0;border-radius:6px;cursor:pointer}
+    button.danger{background:#e74c3c}
+    button.gray{background:#555}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .msg{border-top:1px solid #eee;padding:10px 0}
+    .small{font-size:12px;color:#666}
+    code{background:#eee;padding:2px 6px;border-radius:6px}
+    details{margin:6px 0}
+    pre{background:#fafafa;border:1px solid #eee;padding:8px;border-radius:8px;white-space:pre-wrap}
+    .chip{display:inline-block;background:#eef;border:1px solid #dde;border-radius:999px;padding:6px 10px;margin:4px;cursor:pointer;font-size:12px}
+    .chip:hover{background:#e6f0ff}
+  </style>
+</head>
+<body>
+
+<h2>📅 WA Scheduler (Pesan per Target + Auto Recent)</h2>
+
+<div class="box">
+  <h3>1) Akun</h3>
+  <div class="row">
+    <div>
+      <label>Pilih akun</label>
+      <select id="accountSelect"></select>
+
+      <button class="gray" onclick="refreshStatus()">Refresh Status</button>
+      <button class="danger" onclick="logoutAccount()">Logout Akun</button>
+      <button class="danger" onclick="deleteAccount()">Hapus Akun (Permanent)</button>
+    </div>
+
+    <div>
+      <label>Buat akun baru (ID bebas: a1, toko1, marketing)</label>
+      <input id="newAccountId" placeholder="contoh: a1">
+      <button onclick="initAccount()">Init Akun</button>
+      <div class="small">Setelah init, klik Scan QR.</div>
+    </div>
+  </div>
+
+  <div>
+    <b>Status:</b> <span id="statusText">-</span><br>
+    <a id="qrLink" href="#" target="_blank">🔐 Scan QR</a>
+  </div>
+
+  <div class="small" style="margin-top:10px">
+    <b>Format targets:</b><br>
+    - Normal: <code>0812xxxx</code> atau <code>1203xxx@g.us</code> (pakai pesan default)<br>
+    - Custom per target: <code>0812xxxx | Halo A</code><br>
+    - 1 baris = 1 target (boleh juga pisah target pakai koma di kiri).<br>
+    - Jika tidak pakai <code>|</code>, maka memakai <b>Pesan Default</b>.
+  </div>
+</div>
+
+<div class="box">
+  <h3>2) Auto Recent (yang pernah dipakai)</h3>
+  <button class="danger" onclick="clearRecent()">🧹 Clear Recent (akun ini)</button>
+
+  <h4 style="margin-top:10px">Recent Targets (klik untuk masuk ke Targets)</h4>
+  <div id="recentTargets"><i>Loading...</i></div>
+
+  <h4 style="margin-top:10px">Recent Default Message (klik untuk isi Pesan Default)</h4>
+  <div id="recentMessages"><i>Loading...</i></div>
+
+  <div class="small" style="margin-top:8px">
+    Recent otomatis terisi saat kamu <b>buat</b> atau <b>edit</b> jadwal.
+  </div>
+</div>
+
+<div class="box">
+  <h3>3) Target Grup</h3>
+  <button class="gray" onclick="loadGroups()">📋 List Grup</button>
+  <select id="groupSelect" onchange="pickGroup()">
+    <option value="">(pilih grup untuk ditambahkan ke targets)</option>
+  </select>
+  <div class="small">Kalau list grup error: akun belum login/ready.</div>
+</div>
+
+<div class="box">
+  <h3>4) Tambah Jadwal</h3>
+
+  <label>Targets (1 baris per target)</label>
+  <textarea id="targetsText" rows="6" placeholder="08123456789 | Halo A&#10;08120001111 | Halo B&#10;1203xxx@g.us"></textarea>
+
+  <label>Pesan Default (dipakai kalau baris tidak punya pesan custom)</label>
+  <textarea id="defaultMessage" rows="3" placeholder="Halo, ini pesan default"></textarea>
+
+  <label>Waktu mulai (start)</label>
+  <input id="datetime" type="datetime-local">
+
+  <label>Repeat</label>
+  <select id="repeatType" onchange="toggleInterval()">
+    <option value="once">Sekali</option>
+    <option value="daily">Harian</option>
+    <option value="weekly">Mingguan</option>
+    <option value="monthly">Bulanan</option>
+
+    <option value="interval_seconds">Tiap N detik</option>
+    <option value="interval_minutes">Tiap N menit</option>
+    <option value="interval_hours">Tiap N jam</option>
+    <option value="interval_days">Tiap N hari</option>
+    <option value="interval_months">Tiap N bulan</option>
+  </select>
+
+  <div id="intervalBox" style="display:none">
+    <label>Interval (N)</label>
+    <input id="intervalMinutes" type="number" min="1" value="5">
+    <div class="small">Dipakai untuk semua interval (detik/menit/jam/hari/bulan).</div>
+  </div>
+
+  <h4>Anti-Spam</h4>
+  <div class="row">
+    <div>
+      <label>Jam kirim mulai (HH:MM) — opsional</label>
+      <input id="windowStart" placeholder="08:00">
+    </div>
+    <div>
+      <label>Jam kirim selesai (HH:MM) — opsional</label>
+      <input id="windowEnd" placeholder="20:00">
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Jeda antar target (detik)</label>
+      <input id="gapSeconds" type="number" min="0" value="2">
+    </div>
+    <div>
+      <label>Random delay per target (detik)</label>
+      <div class="row">
+        <input id="rMin" type="number" min="0" value="0" placeholder="min">
+        <input id="rMax" type="number" min="0" value="0" placeholder="max">
+      </div>
+    </div>
+  </div>
+
+  <h4>Batas Repeat (opsional)</h4>
+  <div class="row">
+    <div>
+      <label>Repeat Count (berapa kali kirim)</label>
+      <input id="repeatCount" type="number" min="1" placeholder="contoh: 10 (kosong = tanpa batas)">
+    </div>
+    <div>
+      <label>Repeat Until (sampai tanggal)</label>
+      <input id="repeatUntil" type="datetime-local">
+    </div>
+  </div>
+
+  <button onclick="createMsg()">Simpan Jadwal</button>
+</div>
+
+<div class="box">
+  <h3>5) Jadwal</h3>
+  <div id="list">Loading...</div>
+</div>
+
+<script>
+function getAccountId(){ return document.getElementById('accountSelect').value; }
+function toISOFromLocal(dtLocal){ return dtLocal && dtLocal.length === 16 ? (dtLocal + ':00') : dtLocal; }
+function toLocalValue(iso){ return iso ? iso.slice(0,16) : ''; }
+function escapeHtml(s){
+  return String(s||'').replace(/[&<>"']/g, (c)=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+function toggleInterval(){
+  const rt = document.getElementById('repeatType').value;
+  document.getElementById('intervalBox').style.display = rt.startsWith('interval_') ? 'block' : 'none';
+}
+
+// ---- Recent ----
+async function loadRecent(){
+  const accountId = getAccountId();
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/recent`);
+  const rec = await r.json();
+
+  const rt = document.getElementById('recentTargets');
+  const rm = document.getElementById('recentMessages');
+
+  rt.innerHTML = '';
+  rm.innerHTML = '';
+
+  const targets = rec.targets || [];
+  const messages = rec.messages || [];
+
+  if (targets.length === 0) rt.innerHTML = '<i>Kosong</i>';
+  else {
+    for (const t of targets) {
+      const span = document.createElement('span');
+      span.className = 'chip';
+      span.textContent = t;
+      span.onclick = () => addRecentTargetLine(t);
+      rt.appendChild(span);
+    }
+  }
+
+  if (messages.length === 0) rm.innerHTML = '<i>Kosong</i>';
+  else {
+    for (const m of messages) {
+      const span = document.createElement('span');
+      span.className = 'chip';
+      span.textContent = (m.length > 60 ? (m.slice(0,60)+'...') : m);
+      span.title = m;
+      span.onclick = () => setDefaultMessage(m);
+      rm.appendChild(span);
+    }
+  }
+}
+
+function addRecentTargetLine(line){
+  const ta = document.getElementById('targetsText');
+  const cur = ta.value.trim();
+  ta.value = cur ? (cur + "\n" + line) : line;
+}
+
+function setDefaultMessage(msg){
+  document.getElementById('defaultMessage').value = msg;
+}
+
+async function clearRecent(){
+  const accountId = getAccountId();
+  if (!confirm('Clear recent untuk akun ini?')) return;
+  await fetch(`/accounts/${encodeURIComponent(accountId)}/recent`, { method:'DELETE' });
+  await loadRecent();
+}
+
+// ---- Accounts/UI ----
+async function loadAccounts(){
+  const sel = document.getElementById('accountSelect');
+  sel.innerHTML = '';
+
+  let accounts = [];
+  try {
+    const r = await fetch('/accounts');
+    accounts = await r.json();
+  } catch {}
+
+  if (!accounts || accounts.length === 0) accounts = ['a1'];
+
+  for (const a of accounts) {
+    const opt = document.createElement('option');
+    opt.value = a;
+    opt.textContent = a;
+    sel.appendChild(opt);
+  }
+
+  sel.onchange = async () => {
+    await refreshStatus();
+    await loadMessages();
+    await loadRecent();
+    clearGroups();
+  };
+
+  await refreshStatus();
+  await loadMessages();
+  await loadRecent();
+}
+
+async function initAccount(){
+  const id = document.getElementById('newAccountId').value.trim();
+  if (!id) return alert('Isi accountId dulu');
+
+  await fetch(`/accounts/${encodeURIComponent(id)}/init`, { method: 'POST' });
+
+  await loadAccounts();
+  document.getElementById('accountSelect').value = id;
+  await refreshStatus();
+  await loadMessages();
+  await loadRecent();
+  alert('Akun dibuat. Klik Scan QR untuk login.');
+}
+
+async function refreshStatus(){
+  const accountId = getAccountId();
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/status`);
+  const s = await r.json();
+
+  document.getElementById('statusText').textContent =
+    s.ready
+      ? `✅ Terhubung (jadwal: ${s.scheduledCount}, queue: ${s.queueLength})`
+      : `❌ Belum login (jadwal: ${s.scheduledCount}, queue: ${s.queueLength})`;
+
+  const qr = document.getElementById('qrLink');
+  qr.href = `/accounts/${encodeURIComponent(accountId)}/qr`;
+  qr.textContent = `🔐 Scan QR (${accountId})`;
+}
+
+async function logoutAccount(){
+  const accountId = getAccountId();
+  if (!confirm(`Logout akun ${accountId}?`)) return;
+
+  await fetch(`/accounts/${encodeURIComponent(accountId)}/logout`, { method:'POST' });
+  alert('Logout berhasil. Klik Scan QR untuk login ulang.');
+  clearGroups();
+  await refreshStatus();
+}
+
+async function deleteAccount(){
+  const accountId = getAccountId();
+  if (!confirm(`HAPUS PERMANEN akun ${accountId}? (session + jadwal + recent akan hilang)`)) return;
+
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}`, { method:'DELETE' });
+  const j = await r.json();
+  if (!r.ok) return alert('Gagal: ' + (j.error || 'unknown'));
+
+  alert(j.message || 'Akun dihapus');
+  clearGroups();
+  await loadAccounts();
+}
+
+// ---- Groups ----
+function clearGroups(){
+  const sel = document.getElementById('groupSelect');
+  sel.innerHTML = `<option value="">(pilih grup untuk ditambahkan ke targets)</option>`;
+}
+
+async function loadGroups(){
+  const accountId = getAccountId();
+  clearGroups();
+
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/groups`);
+  if (!r.ok) return alert('Gagal load grup: ' + await r.text());
+
+  const groups = await r.json();
+  const sel = document.getElementById('groupSelect');
+
+  if (!groups || groups.length === 0) return alert('Tidak ada grup / akun belum ready.');
+
+  for (const g of groups) {
+    const opt = document.createElement('option');
+    opt.value = g.id;
+    opt.textContent = `${g.name} (${g.id})`;
+    sel.appendChild(opt);
+  }
+  alert('Daftar grup dimuat. Pilih grup untuk ditambahkan ke targets.');
+}
+
+function pickGroup(){
+  const sel = document.getElementById('groupSelect');
+  const id = sel.value;
+  if (!id) return;
+  addRecentTargetLine(id);
+  sel.value = "";
+}
+
+// ---- Schedules ----
+function repeatLabel(m){
+  const rt = m.repeatType || 'once';
+  if (rt === 'once') return 'Sekali';
+  if (rt === 'daily') return 'Harian';
+  if (rt === 'weekly') return 'Mingguan';
+  if (rt === 'monthly') return 'Bulanan';
+
+  const n = m.intervalMinutes || 1; // interval value
+  if (rt === 'interval_seconds') return `Tiap ${n} detik`;
+  if (rt === 'interval_minutes') return `Tiap ${n} menit`;
+  if (rt === 'interval_hours') return `Tiap ${n} jam`;
+  if (rt === 'interval_days') return `Tiap ${n} hari`;
+  if (rt === 'interval_months') return `Tiap ${n} bulan`;
+  return rt;
+}
+
+async function createMsg(){
+  const accountId = getAccountId();
+
+  const payload = {
+    targetsText: document.getElementById('targetsText').value.trim(),
+    defaultMessage: document.getElementById('defaultMessage').value.trim(),
+    datetimeISO: toISOFromLocal(document.getElementById('datetime').value),
+
+    repeatType: document.getElementById('repeatType').value,
+    intervalMinutes: document.getElementById('intervalMinutes').value, // interval value
+
+    repeatCount: document.getElementById('repeatCount').value || undefined,
+    repeatUntilISO: toISOFromLocal(document.getElementById('repeatUntil').value) || undefined,
+
+    windowStart: document.getElementById('windowStart').value.trim() || undefined,
+    windowEnd: document.getElementById('windowEnd').value.trim() || undefined,
+
+    gapSeconds: document.getElementById('gapSeconds').value,
+    randomDelayMinSeconds: document.getElementById('rMin').value,
+    randomDelayMaxSeconds: document.getElementById('rMax').value,
+  };
+
+  if (!payload.targetsText || !payload.datetimeISO) {
+    return alert('Targets dan waktu mulai wajib diisi.');
+  }
+
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/messages`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+
+  if (!r.ok) return alert('Gagal: ' + await r.text());
+
+  await loadMessages();
+  await refreshStatus();
+  await loadRecent();
+}
+
+async function loadMessages(){
+  const accountId = getAccountId();
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/messages`);
+  const data = await r.json();
+
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+
+  if (!data || data.length === 0){
+    list.innerHTML = '<i>Tidak ada jadwal</i>';
+    return;
+  }
+
+  data.sort((a,b)=> new Date(a.datetimeISO) - new Date(b.datetimeISO));
+
+  for (const m of data){
+    const targetsPretty = (m.targets || []).map(x => `${x.target} | ${x.message}`).join("\n");
+
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = `
+      <b>Repeat:</b> ${escapeHtml(repeatLabel(m))}<br>
+      <span class="small">Start: ${new Date(m.datetimeISO).toLocaleString()}</span><br>
+      ${m.repeatUntilISO ? `<span class="small">Until: ${new Date(m.repeatUntilISO).toLocaleString()}</span><br>` : ``}
+      ${typeof m.remainingCount === 'number' ? `<span class="small">Remaining: ${m.remainingCount}</span><br>` : ``}
+      <span class="small">Window: ${escapeHtml(m.windowStart || '-')} - ${escapeHtml(m.windowEnd || '-')}</span><br>
+      <span class="small">Gap: ${m.gapSeconds}s | Random: ${m.randomDelayMinSeconds}-${m.randomDelayMaxSeconds}s</span>
+
+      <div style="margin-top:8px"><b>Targets + Pesan:</b><pre>${escapeHtml(targetsPretty)}</pre></div>
+      <div><b>Pesan Default:</b><pre>${escapeHtml(m.defaultMessage || '')}</pre></div>
+
+      <details>
+        <summary>Edit</summary>
+
+        <label>Targets (format: target | pesan) — 1 baris per target</label>
+        <textarea id="t_${m.id}" rows="6">${escapeHtml(m.targetsText || targetsPretty)}</textarea>
+
+        <label>Pesan Default</label>
+        <textarea id="def_${m.id}" rows="3">${escapeHtml(m.defaultMessage || '')}</textarea>
+
+        <label>Waktu mulai (start)</label>
+        <input id="d_${m.id}" type="datetime-local" value="${toLocalValue(m.datetimeISO)}">
+
+        <label>Repeat</label>
+        <select id="rt_${m.id}" onchange="toggleEditInterval(${m.id})">
+          <option value="once">Sekali</option>
+          <option value="daily">Harian</option>
+          <option value="weekly">Mingguan</option>
+          <option value="monthly">Bulanan</option>
+
+          <option value="interval_seconds">Tiap N detik</option>
+          <option value="interval_minutes">Tiap N menit</option>
+          <option value="interval_hours">Tiap N jam</option>
+          <option value="interval_days">Tiap N hari</option>
+          <option value="interval_months">Tiap N bulan</option>
+        </select>
+
+        <div id="ibox_${m.id}" style="display:none">
+          <label>Interval (N)</label>
+          <input id="im_${m.id}" type="number" min="1" value="${m.intervalMinutes || 5}">
+          <div class="small">Dipakai untuk semua interval.</div>
+        </div>
+
+        <h4>Window & Delay</h4>
+        <div class="row">
+          <div>
+            <label>Window Start (HH:MM)</label>
+            <input id="ws_${m.id}" value="${escapeHtml(m.windowStart || '')}" placeholder="08:00">
+          </div>
+          <div>
+            <label>Window End (HH:MM)</label>
+            <input id="we_${m.id}" value="${escapeHtml(m.windowEnd || '')}" placeholder="20:00">
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Gap Seconds</label>
+            <input id="gap_${m.id}" type="number" min="0" value="${m.gapSeconds ?? 2}">
+          </div>
+          <div>
+            <label>Random Delay (min/max detik)</label>
+            <div class="row">
+              <input id="rmin_${m.id}" type="number" min="0" value="${m.randomDelayMinSeconds ?? 0}">
+              <input id="rmax_${m.id}" type="number" min="0" value="${m.randomDelayMaxSeconds ?? 0}">
+            </div>
+          </div>
+        </div>
+
+        <h4>Batas Repeat</h4>
+        <div class="row">
+          <div>
+            <label>Repeat Count</label>
+            <input id="rc_${m.id}" type="number" min="1" value="${typeof m.remainingCount === 'number' ? m.remainingCount : ''}">
+          </div>
+          <div>
+            <label>Repeat Until</label>
+            <input id="ru_${m.id}" type="datetime-local" value="${m.repeatUntilISO ? toLocalValue(m.repeatUntilISO) : ''}">
+          </div>
+        </div>
+
+        <button onclick="editMsg(${m.id})">Simpan Perubahan</button>
+      </details>
+
+      <button class="danger" onclick="delMsg(${m.id})">Hapus Jadwal</button>
+      <div class="small">ID: ${m.id}</div>
+    `;
+
+    list.appendChild(div);
+
+    document.getElementById(`rt_${m.id}`).value = (m.repeatType || 'once');
+    toggleEditInterval(m.id);
+  }
+}
+
+function toggleEditInterval(id){
+  const rt = document.getElementById(`rt_${id}`).value;
+  document.getElementById(`ibox_${id}`).style.display = rt.startsWith('interval_') ? 'block' : 'none';
+}
+
+async function editMsg(id){
+  const accountId = getAccountId();
+
+  const payload = {
+    targetsText: document.getElementById(`t_${id}`).value.trim(),
+    defaultMessage: document.getElementById(`def_${id}`).value.trim(),
+    datetimeISO: toISOFromLocal(document.getElementById(`d_${id}`).value),
+
+    repeatType: document.getElementById(`rt_${id}`).value,
+    intervalMinutes: document.getElementById(`im_${id}`)?.value,
+
+    repeatCount: document.getElementById(`rc_${id}`).value || "",
+    repeatUntilISO: toISOFromLocal(document.getElementById(`ru_${id}`).value) || "",
+
+    windowStart: document.getElementById(`ws_${id}`).value.trim() || "",
+    windowEnd: document.getElementById(`we_${id}`).value.trim() || "",
+
+    gapSeconds: document.getElementById(`gap_${id}`).value,
+    randomDelayMinSeconds: document.getElementById(`rmin_${id}`).value,
+    randomDelayMaxSeconds: document.getElementById(`rmax_${id}`).value,
+  };
+
+  const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/messages/${id}`,{
+    method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+
+  if (!r.ok) return alert('Gagal: ' + await r.text());
+
+  await loadMessages();
+  await refreshStatus();
+  await loadRecent();
+}
+
+async function delMsg(id){
+  if (!confirm('Hapus jadwal ini?')) return;
+  const accountId = getAccountId();
+
+  await fetch(`/accounts/${encodeURIComponent(accountId)}/messages/${id}`, { method:'DELETE' });
+
+  await loadMessages();
+  await refreshStatus();
+}
+
+loadAccounts();
+toggleInterval();
+setInterval(refreshStatus, 5000);
+</script>
+
+</body>
+</html>
