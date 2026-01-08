@@ -1,72 +1,72 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # =========================
 # WA Scheduler - start.sh
-# Debian/Ubuntu VPS Fresh
+# Auto download app.js + public/index.html
 # =========================
 
 APP_NAME="wa-scheduler"
 APP_ENTRY="app.js"
-
-# ✅ default port 300 (bisa override: APP_PORT=3000 bash start.sh)
 APP_PORT="${APP_PORT:-300}"
-
-NODE_MAJOR="${NODE_MAJOR:-20}"   # Node LTS (ubah 18 kalau mau)
+NODE_MAJOR="${NODE_MAJOR:-20}"
 TZ_REGION="Asia/Jakarta"
 
-echo "==> [1/9] Check working directory"
-if [[ ! -f "$APP_ENTRY" ]]; then
-  echo "ERROR: $APP_ENTRY tidak ditemukan di folder ini."
-  echo "Jalankan start.sh di folder project (ada app.js dan folder public/)."
-  exit 1
-fi
-if [[ ! -d "public" ]]; then
-  echo "WARNING: folder ./public tidak ditemukan. Pastikan index.html ada di public/."
-fi
+APP_JS_URL="https://raw.githubusercontent.com/casper9/wa-jadwal/main/app.js"
+INDEX_HTML_URL="https://raw.githubusercontent.com/casper9/wa-jadwal/main/public/index.html"
 
-echo "==> [2/9] Set timezone to ${TZ_REGION}"
+trap 'echo ""; echo "❌ ERROR di baris $LINENO"; echo "Command: $BASH_COMMAND"; exit 1' ERR
+
+echo "==> [1/10] Prepare project files"
+
+# ambil app.js (overwrite biar selalu update)
+echo "Download app.js dari GitHub..."
+curl -fsSL "$APP_JS_URL" -o app.js
+
+# buat folder public jika belum ada
+mkdir -p public
+
+# ambil index.html (overwrite)
+echo "Download public/index.html dari GitHub..."
+curl -fsSL "$INDEX_HTML_URL" -o public/index.html
+
+echo "✅ app.js & public/index.html siap"
+
+echo "==> [2/10] Set timezone ${TZ_REGION}"
 sudo apt-get update -y
 sudo apt-get install -y tzdata
 sudo ln -sf "/usr/share/zoneinfo/${TZ_REGION}" /etc/localtime
 sudo dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-echo "==> [3/9] Install base packages"
+echo "==> [3/10] Install base packages"
 sudo apt-get install -y curl ca-certificates gnupg git build-essential
 
-echo "==> [4/9] Install Chromium + dependencies (for whatsapp-web.js puppeteer)"
-# beberapa distro pakai libasound2t64
+echo "==> [4/10] Install Chromium (Puppeteer)"
 sudo apt-get install -y chromium \
   fonts-liberation \
   libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 libgbm1 libgtk-3-0 \
   libnspr4 libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 || true
 
-# fallback kalau libasound2t64 tidak ada
 sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2 || true
 
-echo "==> [5/9] Install Node.js ${NODE_MAJOR}.x + npm"
+echo "==> [5/10] Install Node.js ${NODE_MAJOR}.x"
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
   sudo apt-get install -y nodejs
-else
-  echo "Node sudah ada: $(node -v)"
 fi
 
-echo "==> [6/9] Install PM2 globally"
-sudo npm i -g pm2
+echo "==> [6/10] Install PM2"
+sudo npm install -g pm2
 
-echo "==> [7/9] Install project dependencies"
+echo "==> [7/10] Install npm dependencies"
 if [[ ! -f package.json ]]; then
-  echo "package.json tidak ada. Membuat minimal package.json..."
   cat > package.json <<'JSON'
 {
   "name": "wa-scheduler",
   "version": "1.0.0",
   "main": "app.js",
   "type": "commonjs",
-  "scripts": {
-    "start": "node app.js"
-  },
+  "scripts": { "start": "node app.js" },
   "dependencies": {
     "express": "^4.19.2",
     "node-schedule": "^2.1.1",
@@ -78,60 +78,32 @@ if [[ ! -f package.json ]]; then
 JSON
 fi
 
+export PUPPETEER_SKIP_DOWNLOAD=1
 npm install
 mkdir -p data
 
-echo "==> [8/9] Configure UFW (allow port ${APP_PORT}/tcp + allow outgoing)"
-# install ufw jika belum ada
+echo "==> [8/10] Configure UFW"
 sudo apt-get install -y ufw
-
-# set default policy (incoming deny, outgoing allow)
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-
-# allow SSH supaya tidak terkunci (biasanya port 22)
 sudo ufw allow OpenSSH || true
 sudo ufw allow 22/tcp || true
-
-# allow app port
 sudo ufw allow "${APP_PORT}/tcp"
-
-# enable ufw (non-interactive)
 sudo ufw --force enable
-sudo ufw status verbose || true
 
-echo "==> [9/9] Start with PM2 + enable auto-start on reboot"
+echo "==> [9/10] Start app with PM2"
 pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
-
-# (opsional) kalau chromium sudah diinstall dari apt, puppeteer tidak perlu download
-export PUPPETEER_SKIP_DOWNLOAD=1
-
-# set PORT untuk app
 export PORT="$APP_PORT"
-
-pm2 start "$APP_ENTRY" --name "$APP_NAME" --time
+pm2 start app.js --name "$APP_NAME" --time
 pm2 save
 
-# enable pm2 startup
-STARTUP_OUT="$(pm2 startup systemd -u "$USER" --hp "$HOME" || true)"
-STARTUP_CMD="$(echo "$STARTUP_OUT" | tail -n 1 | sed 's/^\s*//')"
-if [[ "$STARTUP_CMD" == sudo* ]]; then
-  echo "Running PM2 startup command..."
-  eval "$STARTUP_CMD"
-  pm2 save
-else
-  echo "NOTE: Kalau auto-start belum aktif, jalankan manual:"
-  echo "pm2 startup systemd -u $USER --hp $HOME"
-  echo "pm2 save"
-fi
+echo "==> [10/10] Enable PM2 auto-start"
+pm2 startup systemd -u "$USER" --hp "$HOME" | grep sudo | bash || true
+pm2 save
 
 echo ""
-echo "✅ DONE!"
-echo "App Name : $APP_NAME"
-echo "Port     : $APP_PORT"
-echo "UFW      : allow ${APP_PORT}/tcp, outgoing allow"
-echo ""
-echo "Cek:"
-echo "- pm2 status"
-echo "- pm2 logs $APP_NAME"
-echo "- buka: http://IP-VPS:${APP_PORT}/"
+echo "✅ SELESAI"
+echo "App  : $APP_NAME"
+echo "Port : $APP_PORT"
+echo "URL  : http://IP-VPS:$APP_PORT"
+echo "Logs : pm2 logs $APP_NAME"
