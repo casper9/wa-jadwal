@@ -19,6 +19,7 @@
     pre{background:#fafafa;border:1px solid #eee;padding:8px;border-radius:8px;white-space:pre-wrap}
     .chip{display:inline-block;background:#eef;border:1px solid #dde;border-radius:999px;padding:6px 10px;margin:4px;cursor:pointer;font-size:12px}
     .chip:hover{background:#e6f0ff}
+    .logbox{height:260px;overflow:auto;background:#0b1020;color:#cfe3ff;border-radius:10px;padding:10px;border:1px solid rgba(255,255,255,.08);font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-size:12px;white-space:pre-wrap}
   </style>
 </head>
 <body>
@@ -60,7 +61,40 @@
 </div>
 
 <div class="box">
-  <h3>2) Auto Recent (yang pernah dipakai)</h3>
+  <h3>2) Logs (debug setelah restart)</h3>
+  <div class="row">
+    <div>
+      <label>Jumlah baris log</label>
+      <select id="logLines" onchange="loadLogs()">
+        <option value="200">200</option>
+        <option value="300" selected>300</option>
+        <option value="600">600</option>
+        <option value="1000">1000</option>
+      </select>
+      <button class="gray" onclick="loadLogs()">🔄 Refresh Logs</button>
+      <button class="danger" onclick="clearLogs()">🧹 Clear Logs (akun ini)</button>
+      <div class="small">
+        Tips: cari kata <code>READY</code>, <code>Disconnected</code>, <code>NOT READY</code>, <code>SEND FAIL</code>.
+      </div>
+    </div>
+    <div>
+      <label>Auto refresh</label>
+      <select id="logAuto" onchange="setLogAuto()">
+        <option value="0">Off</option>
+        <option value="3000">3 detik</option>
+        <option value="5000" selected>5 detik</option>
+        <option value="10000">10 detik</option>
+      </select>
+      <div class="small">
+        Auto refresh berguna saat kamu baru restart PM2/VPS.
+      </div>
+    </div>
+  </div>
+  <div id="logView" class="logbox">Loading...</div>
+</div>
+
+<div class="box">
+  <h3>3) Auto Recent (yang pernah dipakai)</h3>
   <button class="danger" onclick="clearRecent()">🧹 Clear Recent (akun ini)</button>
 
   <h4 style="margin-top:10px">Recent Targets (klik untuk masuk ke Targets)</h4>
@@ -75,7 +109,7 @@
 </div>
 
 <div class="box">
-  <h3>3) Target Grup</h3>
+  <h3>4) Target Grup</h3>
   <button class="gray" onclick="loadGroups()">📋 List Grup</button>
   <select id="groupSelect" onchange="pickGroup()">
     <option value="">(pilih grup untuk ditambahkan ke targets)</option>
@@ -84,7 +118,7 @@
 </div>
 
 <div class="box">
-  <h3>4) Tambah Jadwal</h3>
+  <h3>5) Tambah Jadwal</h3>
 
   <label>Targets (1 baris per target)</label>
   <textarea id="targetsText" rows="6" placeholder="08123456789 | Halo A&#10;08120001111 | Halo B&#10;1203xxx@g.us"></textarea>
@@ -161,7 +195,7 @@
 </div>
 
 <div class="box">
-  <h3>5) Jadwal</h3>
+  <h3>6) Jadwal</h3>
   <div id="list">Loading...</div>
 </div>
 
@@ -177,6 +211,38 @@ function escapeHtml(s){
 function toggleInterval(){
   const rt = document.getElementById('repeatType').value;
   document.getElementById('intervalBox').style.display = rt.startsWith('interval_') ? 'block' : 'none';
+}
+
+// ---- Logs ----
+let logTimer = null;
+
+async function loadLogs(){
+  const accountId = getAccountId();
+  const lines = document.getElementById('logLines').value || '300';
+  const view = document.getElementById('logView');
+
+  try {
+    const r = await fetch(`/accounts/${encodeURIComponent(accountId)}/logs?lines=${encodeURIComponent(lines)}`);
+    const txt = await r.text();
+    view.textContent = txt || 'No logs yet.';
+    // auto scroll ke bawah
+    view.scrollTop = view.scrollHeight;
+  } catch(e){
+    view.textContent = 'Gagal load logs: ' + e;
+  }
+}
+
+async function clearLogs(){
+  const accountId = getAccountId();
+  if (!confirm('Clear logs untuk akun ini?')) return;
+  await fetch(`/accounts/${encodeURIComponent(accountId)}/logs`, { method:'DELETE' });
+  await loadLogs();
+}
+
+function setLogAuto(){
+  const ms = Number(document.getElementById('logAuto').value || 0);
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+  if (ms > 0) logTimer = setInterval(loadLogs, ms);
 }
 
 // ---- Recent ----
@@ -259,12 +325,14 @@ async function loadAccounts(){
     await refreshStatus();
     await loadMessages();
     await loadRecent();
+    await loadLogs();
     clearGroups();
   };
 
   await refreshStatus();
   await loadMessages();
   await loadRecent();
+  await loadLogs();
 }
 
 async function initAccount(){
@@ -278,6 +346,7 @@ async function initAccount(){
   await refreshStatus();
   await loadMessages();
   await loadRecent();
+  await loadLogs();
   alert('Akun dibuat. Klik Scan QR untuk login.');
 }
 
@@ -304,6 +373,7 @@ async function logoutAccount(){
   alert('Logout berhasil. Klik Scan QR untuk login ulang.');
   clearGroups();
   await refreshStatus();
+  await loadLogs();
 }
 
 async function deleteAccount(){
@@ -407,12 +477,12 @@ async function createMsg(){
 
   if (!r.ok) return alert('Gagal: ' + await r.text());
 
-  // reset kecil
   document.getElementById('stopOnReplyKeyword').value = '';
 
   await loadMessages();
   await refreshStatus();
   await loadRecent();
+  await loadLogs();
 }
 
 async function loadMessages(){
@@ -573,6 +643,7 @@ async function editMsg(id){
   await loadMessages();
   await refreshStatus();
   await loadRecent();
+  await loadLogs();
 }
 
 async function delMsg(id){
@@ -583,11 +654,15 @@ async function delMsg(id){
 
   await loadMessages();
   await refreshStatus();
+  await loadLogs();
 }
 
 loadAccounts();
 toggleInterval();
 setInterval(refreshStatus, 5000);
+
+// logs auto
+setLogAuto();
 </script>
 
 </body>
