@@ -1,3 +1,11 @@
+/**
+ * app.js — WA Scheduler (multi account) + per-target message + auto recent + stop on reply
+ * + FIX reboot issue: waitUntilReady + safeSendMessage retry + disconnected handling
+ * + LOGGING: file logs per account + endpoint /accounts/:accountId/logs + tampilkan di index.html
+ */
+
+process.env.TZ = process.env.TZ || "Asia/Makassar"; // ganti ke "Asia/Jakarta" jika perlu
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -13,6 +21,29 @@ const PORT = process.env.PORT || 3000;
 
 const DATA_DIR = path.join(__dirname, "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ---------- LOGGING ----------
+const LOG_DIR = path.join(__dirname, "logs");
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+function logFile(accountId) {
+  return path.join(LOG_DIR, `wa-${accountId}.log`);
+}
+function ts() {
+  return new Date().toISOString();
+}
+function log(accountId, level, msg, extra) {
+  const line =
+    `[${ts()}] [${accountId}] [${level}] ${msg}` + (extra ? ` | ${extra}` : "");
+  console.log(line);
+  try {
+    fs.appendFileSync(logFile(accountId), line + "\n", "utf8");
+  } catch {}
+}
+function errToStr(e) {
+  if (!e) return "";
+  return e.stack || e.message || String(e);
+}
 
 // ---------- file helpers ----------
 function atomicWriteJson(filePath, data) {
@@ -54,7 +85,7 @@ function pickChromePath() {
 }
 const chromePath = pickChromePath();
 
-// ✅ rimraf replacement (fix: rimraf is not a function)
+// ✅ rm -rf replacement
 function removeDirSafe(dirPath) {
   try {
     fs.rmSync(dirPath, { recursive: true, force: true });
@@ -93,10 +124,6 @@ function containsKeyword(text, keyword) {
 }
 
 // ---------- parsing per-target message ----------
-// per line formats:
-// 1) target
-// 2) target | custom message
-// left can include multiple targets separated by comma/semicolon
 function parseTargetsWithMessages(text, defaultMessage) {
   const lines = String(text || "")
     .split(/\n+/)
@@ -132,7 +159,7 @@ function parseTargetsWithMessages(text, defaultMessage) {
   return out;
 }
 
-// ---------- repeat (interval detik/menit/jam/hari/bulan) ----------
+// ---------- repeat ----------
 function buildScheduleSpec(datetimeISO, repeatType, intervalValue) {
   const dt = new Date(datetimeISO);
 
@@ -144,7 +171,6 @@ function buildScheduleSpec(datetimeISO, repeatType, intervalValue) {
 
   if (repeatType === "once") return { kind: "date", value: dt };
 
-  // Cron 6-field: second minute hour day month dayOfWeek
   if (repeatType === "daily") return { kind: "cron", value: `${sec} ${minute} ${hour} * * *` };
   if (repeatType === "weekly") return { kind: "cron", value: `${sec} ${minute} ${hour} * * ${dow}` };
   if (repeatType === "monthly") return { kind: "cron", value: `${sec} ${minute} ${hour} ${dom} * *` };
@@ -155,11 +181,7 @@ function buildScheduleSpec(datetimeISO, repeatType, intervalValue) {
   if (repeatType === "interval_seconds") return { kind: "cron", value: `*/${n} * * * * *` };
   if (repeatType === "interval_minutes") return { kind: "cron", value: `${sec} */${n} * * * *` };
   if (repeatType === "interval_hours") return { kind: "cron", value: `${sec} ${minute} */${n} * * *` };
-
-  // Simple day-of-month step (bisa “lompat” saat beda jumlah hari di bulan)
   if (repeatType === "interval_days") return { kind: "cron", value: `${sec} ${minute} ${hour} */${n} * *` };
-
-  // Simple bulan: tanggal sama (dom) tiap N bulan
   if (repeatType === "interval_months") return { kind: "cron", value: `${sec} ${minute} ${hour} ${dom} */${n} *` };
 
   return { kind: "date", value: dt };
@@ -214,6 +236,42 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (b - a + 1)) + a;
 }
 
+// ---------- READY/RETRY FIX ----------
+async function waitUntilReady(accountId, timeoutMs = 90_000) {
+  const acc = ensureAccount(accountId);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (acc.ready && acc.client) return true;
+    await sleep(1000);
+  }
+  return false;
+}
+
+async function safeSendMessage(accountId, chatId, text, maxRetry = 3) {
+  const acc = ensureAccount(accountId);
+
+  for (let attempt = 1; attempt <= maxRetry; attempt++) {
+    try {
+      if (!acc.ready) {
+        log(accountId, "WARN", `Not ready. waitUntilReady... (attempt ${attempt})`);
+        const ok = await waitUntilReady(accountId, 60_000);
+        if (!ok) throw new Error("Client not ready (timeout)");
+      }
+
+      log(accountId, "INFO", `Sending attempt ${attempt} -> ${chatId}`, `len=${String(text || "").length}`);
+      await acc.client.sendMessage(chatId, String(text || ""));
+      log(accountId, "INFO", `SEND OK -> ${chatId}`);
+      return true;
+    } catch (e) {
+      log(accountId, "ERROR", `SEND FAIL attempt ${attempt} -> ${chatId}`, errToStr(e));
+      if (attempt < maxRetry) await sleep(3000 * attempt);
+    }
+  }
+
+  log(accountId, "ERROR", `GIVE UP sending -> ${chatId}`);
+  return false;
+}
+
 // ---------- RECENT (per account) ----------
 function recentFile(accountId) {
   return path.join(DATA_DIR, `recent.${accountId}.json`);
@@ -229,7 +287,6 @@ function saveRecent(accountId, recentObj) {
   atomicWriteJson(recentFile(accountId), recentObj);
 }
 
-// store recent targets lines + default message
 function updateRecent(accountId, targetsText, defaultMessage) {
   const rec = loadRecent(accountId);
 
@@ -255,21 +312,6 @@ function updateRecent(accountId, targetsText, defaultMessage) {
 }
 
 // ---------- multi account manager ----------
-/**
-Schedule item:
-{
-  id,
-  targets: [{target,message}],
-  targetsText,
-  defaultMessage,
-  datetimeISO,
-  repeatType, intervalMinutes,
-  repeatUntilISO?, remainingCount?,
-  windowStart?, windowEnd?,
-  gapSeconds?, randomDelayMinSeconds?, randomDelayMaxSeconds?,
-  stopOnReplyKeyword?   // ✅ stop repeat if incoming reply contains this keyword
-}
-**/
 const accounts = {};
 
 function ensureAccount(accountId) {
@@ -311,22 +353,28 @@ function ensureAccount(accountId) {
   client.on("qr", async (qr) => {
     acc.qrDataUrl = await qrcode.toDataURL(qr);
     acc.ready = false;
-    console.log(`[${accountId}] QR generated: /accounts/${accountId}/qr`);
+    log(accountId, "INFO", "QR generated (need scan)");
   });
 
-  client.on("authenticated", () => console.log(`[${accountId}] Authenticated`));
+  client.on("authenticated", () => log(accountId, "INFO", "Authenticated"));
+
   client.on("auth_failure", (m) => {
     acc.ready = false;
-    console.log(`[${accountId}] Auth failure:`, m);
+    log(accountId, "ERROR", "Auth failure", String(m || ""));
+  });
+
+  client.on("disconnected", (reason) => {
+    acc.ready = false;
+    log(accountId, "WARN", "Disconnected", String(reason || ""));
   });
 
   client.on("ready", () => {
     acc.ready = true;
-    console.log(`[${accountId}] READY`);
+    log(accountId, "INFO", "READY");
     rescheduleAll(accountId);
   });
 
-  // ✅ STOP repeat jika ada balasan masuk dari target yg mengandung keyword
+  // ✅ STOP repeat jika ada balasan masuk mengandung keyword
   client.on("message", async (msg) => {
     try {
       if (!msg) return;
@@ -335,7 +383,6 @@ function ensureAccount(accountId) {
       const fromChatId = String(msg.from || "");
       const body = String(msg.body || "");
 
-      // loop copy agar aman saat splice
       for (const item of acc.messages.slice()) {
         const keyword = item.stopOnReplyKeyword;
         if (!keyword) continue;
@@ -346,11 +393,8 @@ function ensureAccount(accountId) {
 
         if (!containsKeyword(body, keyword)) continue;
 
-        console.log(
-          `[${accountId}] STOP repeat id=${item.id} (reply contains "${keyword}") from ${fromChatId}`
-        );
+        log(accountId, "WARN", `STOP repeat id=${item.id} (reply contains "${keyword}")`, `from=${fromChatId}`);
 
-        // cancel job + remove schedule
         try {
           acc.jobs[item.id]?.cancel();
         } catch {}
@@ -363,7 +407,7 @@ function ensureAccount(accountId) {
         }
       }
     } catch (e) {
-      console.log(`[${accountId}] message handler error:`, e);
+      log(accountId, "ERROR", "message handler error", errToStr(e));
     }
   });
 
@@ -371,6 +415,7 @@ function ensureAccount(accountId) {
   acc.client = client;
 
   accounts[accountId] = acc;
+  log(accountId, "INFO", "Account initialized (Client.initialize called)");
   return acc;
 }
 
@@ -405,7 +450,7 @@ async function runQueue(accountId) {
     try {
       await task();
     } catch (e) {
-      console.log(`[${accountId}] Queue task failed:`, e);
+      log(accountId, "ERROR", "Queue task failed", errToStr(e));
     }
   }
   acc.queueRunning = false;
@@ -425,15 +470,28 @@ async function sendTargetsPerItem(accountId, item) {
     ? Math.max(0, Math.floor(Number(item.randomDelayMaxSeconds)))
     : 0;
 
+  if (!acc.ready) {
+    const ok = await waitUntilReady(accountId, 90_000);
+    if (!ok) {
+      log(accountId, "WARN", `Not ready, skip sending for item id=${item.id}`);
+      return;
+    }
+  }
+
+  log(accountId, "INFO", `Start sending item id=${item.id}`, `targets=${list.length}`);
+
   for (const t of list) {
     const jitter = rMax > 0 || rMin > 0 ? randInt(rMin, rMax) : 0;
     if (jitter > 0) await sleep(jitter * 1000);
 
     const chatId = toChatId(t.target);
-    await acc.client.sendMessage(chatId, String(t.message || ""));
+    const ok = await safeSendMessage(accountId, chatId, String(t.message || ""), 3);
+    if (!ok) log(accountId, "ERROR", `Give up for target`, chatId);
 
     if (gapSec > 0) await sleep(gapSec * 1000);
   }
+
+  log(accountId, "INFO", `Done sending item id=${item.id}`);
 }
 
 // ---------- scheduling ----------
@@ -451,6 +509,8 @@ function afterSendUpdate(accountId, id) {
       acc.jobs[id]?.cancel();
     } catch {}
     delete acc.jobs[id];
+
+    log(accountId, "INFO", `Once schedule done -> removed`, `id=${id}`);
     return;
   }
 
@@ -463,9 +523,12 @@ function afterSendUpdate(accountId, id) {
         acc.jobs[id]?.cancel();
       } catch {}
       delete acc.jobs[id];
+
+      log(accountId, "INFO", `Repeat count ended -> removed`, `id=${id}`);
       return;
     }
     saveMessages(accountId);
+    log(accountId, "DEBUG", `RemainingCount updated`, `id=${id} remaining=${cur.remainingCount}`);
   }
 }
 
@@ -485,12 +548,21 @@ function scheduleOne(accountId, item) {
 
   const job = schedule.scheduleJob(spec.value, async () => {
     try {
+      log(accountId, "DEBUG", `Tick job id=${id}`);
+
       const idx = acc.messages.findIndex((m) => m.id === id);
       if (idx === -1) {
         delete acc.jobs[id];
+        log(accountId, "WARN", `Job tick but item missing -> cancel`, `id=${id}`);
         return;
       }
       const current = acc.messages[idx];
+
+      // reboot safety
+      if (!acc.ready) {
+        log(accountId, "WARN", `Tick id=${id} but NOT READY -> skip (will retry next tick)`);
+        return;
+      }
 
       // until
       if (current.repeatUntilISO && isValidDateString(current.repeatUntilISO)) {
@@ -501,6 +573,8 @@ function scheduleOne(accountId, item) {
           delete acc.jobs[id];
           acc.messages.splice(idx, 1);
           saveMessages(accountId);
+
+          log(accountId, "INFO", `RepeatUntil passed -> removed`, `id=${id}`);
           return;
         }
       }
@@ -513,6 +587,8 @@ function scheduleOne(accountId, item) {
         delete acc.jobs[id];
         acc.messages.splice(idx, 1);
         saveMessages(accountId);
+
+        log(accountId, "INFO", `RemainingCount <=0 -> removed`, `id=${id}`);
         return;
       }
 
@@ -520,6 +596,8 @@ function scheduleOne(accountId, item) {
       const now = new Date();
       if (!isNowInWindow(now, current.windowStart, current.windowEnd)) {
         const waitMs = msUntilWindowStart(now, current.windowStart, current.windowEnd);
+        log(accountId, "DEBUG", `Outside window -> delay`, `id=${id} waitMs=${waitMs}`);
+
         enqueueSend(accountId, async () => {
           const idx2 = acc.messages.findIndex((m) => m.id === id);
           if (idx2 === -1) return;
@@ -531,6 +609,12 @@ function scheduleOne(accountId, item) {
           if (typeof cur2.remainingCount === "number" && cur2.remainingCount <= 0) return;
 
           if (waitMs > 0) await sleep(waitMs);
+
+          const ok = await waitUntilReady(accountId, 60_000);
+          if (!ok) {
+            log(accountId, "WARN", `After window wait, still not ready -> skip`, `id=${id}`);
+            return;
+          }
 
           const now2 = new Date();
           if (!isNowInWindow(now2, cur2.windowStart, cur2.windowEnd)) return;
@@ -546,15 +630,22 @@ function scheduleOne(accountId, item) {
         if (idx2 === -1) return;
         const cur2 = acc.messages[idx2];
 
+        const ok = await waitUntilReady(accountId, 60_000);
+        if (!ok) {
+          log(accountId, "WARN", `Wait ready timeout before send -> skip`, `id=${id}`);
+          return;
+        }
+
         await sendTargetsPerItem(accountId, cur2);
         afterSendUpdate(accountId, id);
       });
     } catch (e) {
-      console.log(`[${accountId}] Job error id=${id}:`, e);
+      log(accountId, "ERROR", `Job error id=${id}`, errToStr(e));
     }
   });
 
   acc.jobs[id] = job;
+  log(accountId, "INFO", `Scheduled job`, `id=${id} type=${repeatType}`);
 }
 
 function rescheduleAll(accountId) {
@@ -582,6 +673,7 @@ function rescheduleAll(accountId) {
   }
 
   saveMessages(accountId);
+  log(accountId, "INFO", `Rescheduled all`, `count=${acc.messages.length}`);
 }
 
 // ---------- Routes ----------
@@ -639,6 +731,35 @@ app.get("/accounts/:accountId/groups", async (req, res) => {
   }
 });
 
+// ----- LOG endpoints -----
+app.get("/accounts/:accountId/logs", (req, res) => {
+  const accountId = req.params.accountId;
+  ensureAccount(accountId);
+
+  const file = logFile(accountId);
+  const linesParam = Number(req.query.lines || 300);
+  const maxLines = Number.isFinite(linesParam) ? Math.min(Math.max(linesParam, 50), 2000) : 300;
+
+  try {
+    if (!fs.existsSync(file)) return res.type("text").send("No logs yet.");
+    const data = fs.readFileSync(file, "utf8");
+    const lines = data.split("\n").filter(Boolean);
+    const tail = lines.slice(-maxLines).join("\n");
+    res.type("text").send(tail);
+  } catch (e) {
+    res.status(500).type("text").send(errToStr(e));
+  }
+});
+
+app.delete("/accounts/:accountId/logs", (req, res) => {
+  const accountId = req.params.accountId;
+  ensureAccount(accountId);
+  try {
+    fs.writeFileSync(logFile(accountId), "", "utf8");
+  } catch {}
+  res.json({ ok: true });
+});
+
 // ----- RECENT endpoints -----
 app.get("/accounts/:accountId/recent", (req, res) => {
   ensureAccount(req.params.accountId);
@@ -674,7 +795,7 @@ app.post("/accounts/:accountId/messages", (req, res) => {
     gapSeconds,
     randomDelayMinSeconds,
     randomDelayMaxSeconds,
-    stopOnReplyKeyword, // ✅ NEW
+    stopOnReplyKeyword,
   } = req.body;
 
   if (!targetsText || !datetimeISO) {
@@ -740,13 +861,10 @@ app.post("/accounts/:accountId/messages", (req, res) => {
     defaultMessage: defMsg,
     datetimeISO: String(datetimeISO),
     repeatType: rt,
-    intervalMinutes: interval, // interval value (N)
+    intervalMinutes: interval,
     repeatUntilISO: until,
     remainingCount,
-
-    // ✅ stop repeat if incoming reply contains this
     stopOnReplyKeyword: keyword ? keyword : undefined,
-
     windowStart: windowStart || undefined,
     windowEnd: windowEnd || undefined,
     gapSeconds: gap,
@@ -758,9 +876,9 @@ app.post("/accounts/:accountId/messages", (req, res) => {
   saveMessages(accountId);
   if (acc.ready) scheduleOne(accountId, item);
 
-  // update recent automatically
   updateRecent(accountId, item.targetsText, item.defaultMessage);
 
+  log(accountId, "INFO", "Schedule created", `id=${item.id} repeat=${item.repeatType}`);
   res.json({ ok: true, item });
 });
 
@@ -845,13 +963,11 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
   if (patch.randomDelayMaxSeconds !== undefined)
     cur.randomDelayMaxSeconds = Math.max(0, Math.floor(Number(patch.randomDelayMaxSeconds || 0)));
 
-  // ✅ NEW: keyword update
   if (patch.stopOnReplyKeyword !== undefined) {
     const k = String(patch.stopOnReplyKeyword || "").trim();
     cur.stopOnReplyKeyword = k ? k : undefined;
   }
 
-  // guard: interval_* harus punya intervalMinutes >=1
   if (String(cur.repeatType || "").startsWith("interval_")) {
     const iv = Number(cur.intervalMinutes);
     if (!Number.isFinite(iv) || iv < 1) return res.status(400).json({ error: "interval value must be >= 1" });
@@ -867,9 +983,9 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
   }
   if (acc.ready) scheduleOne(accountId, cur);
 
-  // update recent automatically
   updateRecent(accountId, cur.targetsText || "", cur.defaultMessage || "");
 
+  log(accountId, "INFO", "Schedule updated", `id=${id}`);
   res.json({ ok: true, item: cur });
 });
 
@@ -891,6 +1007,7 @@ app.delete("/accounts/:accountId/messages/:id", (req, res) => {
   acc.messages.splice(idx, 1);
   saveMessages(accountId);
 
+  log(accountId, "INFO", "Schedule deleted", `id=${id}`);
   res.json({ ok: true });
 });
 
@@ -905,14 +1022,15 @@ app.post("/accounts/:accountId/logout", async (req, res) => {
       await acc.client.logout();
     } catch {}
 
-    // ✅ remove session folder safely
     removeDirSafe(accountSessionDir(accountId));
 
     acc.ready = false;
     acc.qrDataUrl = "";
 
+    log(accountId, "INFO", "Logged out (session removed)");
     res.json({ ok: true, message: `Logged out ${accountId}. Open /accounts/${accountId}/qr to scan again.` });
   } catch (e) {
+    log(accountId, "ERROR", "Logout failed", errToStr(e));
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
@@ -933,7 +1051,6 @@ app.delete("/accounts/:accountId", async (req, res) => {
       } catch {}
     }
 
-    // ✅ remove session folder safely
     removeDirSafe(accountSessionDir(accountId));
 
     try {
@@ -945,13 +1062,22 @@ app.delete("/accounts/:accountId", async (req, res) => {
 
     delete accounts[accountId];
 
+    log(accountId, "INFO", "Account deleted (session+schedules+recent removed)");
     res.json({ ok: true, message: `Account ${accountId} deleted (session + schedules + recent removed)` });
   } catch (e) {
+    log(accountId, "ERROR", "Delete account failed", errToStr(e));
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
 app.get("/health", (req, res) => res.send("ok"));
+
+process.on("unhandledRejection", (reason) => {
+  console.log("[GLOBAL] unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.log("[GLOBAL] uncaughtException:", err);
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
