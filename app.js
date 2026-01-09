@@ -1,6 +1,8 @@
 /**
  * app.js — WA Scheduler (multi account) + per-target message + auto recent + stop on reply
- * + FIX reboot issue: waitUntilReady + safeSendMessage retry + disconnected handling
+ * + FIX interval start respected (interval_seconds/minutes/hours/days)
+ * + Persist interval next run via nextRunISO (survive reboot)
+ * + Auto bootstrap accounts from disk on start
  * + LOGGING: file logs per account + endpoint /accounts/:accountId/logs + tampilkan di index.html
  */
 
@@ -112,6 +114,7 @@ function toChatId(target) {
 }
 
 function accountSessionDir(accountId) {
+  // folder session WA (LocalAuth dataPath)
   return path.join(__dirname, ".wwebjs_auth", `session-wa_${accountId}`);
 }
 
@@ -175,16 +178,36 @@ function buildScheduleSpec(datetimeISO, repeatType, intervalValue) {
   if (repeatType === "weekly") return { kind: "cron", value: `${sec} ${minute} ${hour} * * ${dow}` };
   if (repeatType === "monthly") return { kind: "cron", value: `${sec} ${minute} ${hour} ${dom} * *` };
 
-  const nRaw = Number(intervalValue);
-  const n = Number.isFinite(nRaw) && nRaw >= 1 ? Math.floor(nRaw) : 1;
-
-  if (repeatType === "interval_seconds") return { kind: "cron", value: `*/${n} * * * * *` };
-  if (repeatType === "interval_minutes") return { kind: "cron", value: `${sec} */${n} * * * *` };
-  if (repeatType === "interval_hours") return { kind: "cron", value: `${sec} ${minute} */${n} * * *` };
-  if (repeatType === "interval_days") return { kind: "cron", value: `${sec} ${minute} ${hour} */${n} * *` };
-  if (repeatType === "interval_months") return { kind: "cron", value: `${sec} ${minute} ${hour} ${dom} */${n} *` };
+  // ✅ interval_* jangan pakai cron star-slash, karena start akan diabaikan
+  if (String(repeatType || "").startsWith("interval_")) {
+    const nRaw = Number(intervalValue);
+    const n = Number.isFinite(nRaw) && nRaw >= 1 ? Math.floor(nRaw) : 1;
+    return { kind: "interval", value: n }; // value = N
+  }
 
   return { kind: "date", value: dt };
+}
+
+function intervalMsFromRepeat(repeatType, n) {
+  const v = Math.max(1, Math.floor(Number(n) || 1));
+  if (repeatType === "interval_seconds") return v * 1000;
+  if (repeatType === "interval_minutes") return v * 60 * 1000;
+  if (repeatType === "interval_hours") return v * 60 * 60 * 1000;
+  if (repeatType === "interval_days") return v * 24 * 60 * 60 * 1000;
+  // interval_months: tetap pakai cron monthly, tapi kamu punya interval_months di UI.
+  // supaya fitur tetap ada: kita treat months sebagai "cron monthly" berdasarkan start date.
+  if (repeatType === "interval_months") return null;
+  return null;
+}
+
+function computeNextRunFromStart(startISO, everyMs, nowMs = Date.now()) {
+  const start = new Date(startISO).getTime();
+  if (!Number.isFinite(start)) return new Date(nowMs + everyMs);
+  if (start > nowMs) return new Date(start);
+
+  const diff = nowMs - start;
+  const k = Math.floor(diff / everyMs) + 1;
+  return new Date(start + k * everyMs);
 }
 
 // ---------- window + delay ----------
@@ -314,6 +337,37 @@ function updateRecent(accountId, targetsText, defaultMessage) {
 // ---------- multi account manager ----------
 const accounts = {};
 
+function listAccountIdsFromDisk() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) return [];
+    const files = fs.readdirSync(DATA_DIR);
+    const ids = [];
+    for (const f of files) {
+      const m = f.match(/^scheduledMessages\.(.+)\.json$/);
+      if (m && m[1]) ids.push(m[1]);
+    }
+    return Array.from(new Set(ids));
+  } catch {
+    return [];
+  }
+}
+
+function bootstrapAccountsOnStart() {
+  const ids = listAccountIdsFromDisk();
+  if (ids.length === 0) {
+    console.log("[BOOT] No accounts from disk yet.");
+    return;
+  }
+  console.log("[BOOT] Bootstrapping accounts:", ids.join(", "));
+  for (const id of ids) {
+    try {
+      ensureAccount(id);
+    } catch (e) {
+      console.log("[BOOT] ensureAccount failed for", id, errToStr(e));
+    }
+  }
+}
+
 function ensureAccount(accountId) {
   if (!accountId) throw new Error("accountId required");
   if (accounts[accountId]) return accounts[accountId];
@@ -335,7 +389,11 @@ function ensureAccount(accountId) {
   };
 
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: `wa_${accountId}` }),
+    authStrategy: new LocalAuth({
+      clientId: `wa_${accountId}`,
+      // ✅ stabil: session selalu di folder project (nggak tergantung cwd PM2)
+      dataPath: path.join(__dirname, ".wwebjs_auth"),
+    }),
     puppeteer: {
       headless: true,
       executablePath: chromePath || undefined,
@@ -537,115 +595,256 @@ function scheduleOne(accountId, item) {
   const { id, datetimeISO, repeatType = "once", intervalMinutes } = item;
   if (!isValidDateString(datetimeISO)) return;
 
+  // cancel job lama
   if (acc.jobs[id]) {
-    try {
-      acc.jobs[id].cancel();
-    } catch {}
+    try { acc.jobs[id].cancel(); } catch {}
     delete acc.jobs[id];
   }
 
   const spec = buildScheduleSpec(datetimeISO, repeatType, intervalMinutes);
 
+  // ============================
+  // ✅ INTERVAL MODE (start respected + persist nextRunISO)
+  // ============================
+  if (spec.kind === "interval") {
+    // special: interval_months -> fallback pakai cron monthly (biar fitur tetap ada)
+    if (repeatType === "interval_months") {
+      const dt = new Date(datetimeISO);
+      const sec = dt.getSeconds();
+      const minute = dt.getMinutes();
+      const hour = dt.getHours();
+      const dom = dt.getDate();
+      // tiap bulan di tanggal dom jam:menit:detik
+      const cron = `${sec} ${minute} ${hour} ${dom} */${Math.max(1, Math.floor(Number(spec.value) || 1))} *`;
+      const job = schedule.scheduleJob(cron, () => runTick(accountId, id));
+      acc.jobs[id] = job;
+      log(accountId, "INFO", `Scheduled INTERVAL_MONTHS via cron`, `id=${id} cron=${cron}`);
+      return;
+    }
+
+    const everyMs = intervalMsFromRepeat(repeatType, spec.value);
+    if (!everyMs) {
+      log(accountId, "ERROR", "Interval type unsupported", String(repeatType));
+      return;
+    }
+
+    const next =
+      item.nextRunISO && isValidDateString(item.nextRunISO)
+        ? new Date(item.nextRunISO)
+        : computeNextRunFromStart(datetimeISO, everyMs);
+
+    item.nextRunISO = next.toISOString();
+    saveMessages(accountId);
+
+    const job = schedule.scheduleJob(next, async () => {
+      await runTickInterval(accountId, id, everyMs);
+    });
+
+    acc.jobs[id] = job;
+    log(accountId, "INFO", `Scheduled INTERVAL job`, `id=${id} next=${item.nextRunISO}`);
+    return;
+  }
+
+  // ============================
+  // CRON/ONCE
+  // ============================
   const job = schedule.scheduleJob(spec.value, async () => {
-    try {
-      log(accountId, "DEBUG", `Tick job id=${id}`);
+    await runTick(accountId, id);
+  });
 
-      const idx = acc.messages.findIndex((m) => m.id === id);
-      if (idx === -1) {
-        delete acc.jobs[id];
-        log(accountId, "WARN", `Job tick but item missing -> cancel`, `id=${id}`);
-        return;
-      }
-      const current = acc.messages[idx];
+  acc.jobs[id] = job;
+  log(accountId, "INFO", `Scheduled job`, `id=${id} type=${repeatType}`);
+}
 
-      // reboot safety
-      if (!acc.ready) {
-        log(accountId, "WARN", `Tick id=${id} but NOT READY -> skip (will retry next tick)`);
-        return;
-      }
+async function runTick(accountId, id) {
+  const acc = ensureAccount(accountId);
+  try {
+    log(accountId, "DEBUG", `Tick job id=${id}`);
 
-      // until
-      if (current.repeatUntilISO && isValidDateString(current.repeatUntilISO)) {
-        if (Date.now() > new Date(current.repeatUntilISO).getTime()) {
-          try {
-            acc.jobs[id]?.cancel();
-          } catch {}
-          delete acc.jobs[id];
-          acc.messages.splice(idx, 1);
-          saveMessages(accountId);
+    const idx = acc.messages.findIndex((m) => m.id === id);
+    if (idx === -1) {
+      delete acc.jobs[id];
+      log(accountId, "WARN", `Job tick but item missing -> cancel`, `id=${id}`);
+      return;
+    }
+    const current = acc.messages[idx];
 
-          log(accountId, "INFO", `RepeatUntil passed -> removed`, `id=${id}`);
-          return;
-        }
-      }
+    // reboot safety
+    if (!acc.ready) {
+      log(accountId, "WARN", `Tick id=${id} but NOT READY -> skip (will retry next tick)`);
+      return;
+    }
 
-      // count
-      if (typeof current.remainingCount === "number" && current.remainingCount <= 0) {
-        try {
-          acc.jobs[id]?.cancel();
-        } catch {}
+    // until
+    if (current.repeatUntilISO && isValidDateString(current.repeatUntilISO)) {
+      if (Date.now() > new Date(current.repeatUntilISO).getTime()) {
+        try { acc.jobs[id]?.cancel(); } catch {}
         delete acc.jobs[id];
         acc.messages.splice(idx, 1);
         saveMessages(accountId);
-
-        log(accountId, "INFO", `RemainingCount <=0 -> removed`, `id=${id}`);
+        log(accountId, "INFO", `RepeatUntil passed -> removed`, `id=${id}`);
         return;
       }
+    }
 
-      // window check
-      const now = new Date();
-      if (!isNowInWindow(now, current.windowStart, current.windowEnd)) {
-        const waitMs = msUntilWindowStart(now, current.windowStart, current.windowEnd);
-        log(accountId, "DEBUG", `Outside window -> delay`, `id=${id} waitMs=${waitMs}`);
+    // count
+    if (typeof current.remainingCount === "number" && current.remainingCount <= 0) {
+      try { acc.jobs[id]?.cancel(); } catch {}
+      delete acc.jobs[id];
+      acc.messages.splice(idx, 1);
+      saveMessages(accountId);
+      log(accountId, "INFO", `RemainingCount <=0 -> removed`, `id=${id}`);
+      return;
+    }
 
-        enqueueSend(accountId, async () => {
-          const idx2 = acc.messages.findIndex((m) => m.id === id);
-          if (idx2 === -1) return;
-          const cur2 = acc.messages[idx2];
-
-          if (cur2.repeatUntilISO && isValidDateString(cur2.repeatUntilISO)) {
-            if (Date.now() > new Date(cur2.repeatUntilISO).getTime()) return;
-          }
-          if (typeof cur2.remainingCount === "number" && cur2.remainingCount <= 0) return;
-
-          if (waitMs > 0) await sleep(waitMs);
-
-          const ok = await waitUntilReady(accountId, 60_000);
-          if (!ok) {
-            log(accountId, "WARN", `After window wait, still not ready -> skip`, `id=${id}`);
-            return;
-          }
-
-          const now2 = new Date();
-          if (!isNowInWindow(now2, cur2.windowStart, cur2.windowEnd)) return;
-
-          await sendTargetsPerItem(accountId, cur2);
-          afterSendUpdate(accountId, id);
-        });
-        return;
-      }
+    // window check
+    const now = new Date();
+    if (!isNowInWindow(now, current.windowStart, current.windowEnd)) {
+      const waitMs = msUntilWindowStart(now, current.windowStart, current.windowEnd);
+      log(accountId, "DEBUG", `Outside window -> delay`, `id=${id} waitMs=${waitMs}`);
 
       enqueueSend(accountId, async () => {
         const idx2 = acc.messages.findIndex((m) => m.id === id);
         if (idx2 === -1) return;
         const cur2 = acc.messages[idx2];
 
+        if (cur2.repeatUntilISO && isValidDateString(cur2.repeatUntilISO)) {
+          if (Date.now() > new Date(cur2.repeatUntilISO).getTime()) return;
+        }
+        if (typeof cur2.remainingCount === "number" && cur2.remainingCount <= 0) return;
+
+        if (waitMs > 0) await sleep(waitMs);
+
         const ok = await waitUntilReady(accountId, 60_000);
         if (!ok) {
-          log(accountId, "WARN", `Wait ready timeout before send -> skip`, `id=${id}`);
+          log(accountId, "WARN", `After window wait, still not ready -> skip`, `id=${id}`);
           return;
         }
+
+        const now2 = new Date();
+        if (!isNowInWindow(now2, cur2.windowStart, cur2.windowEnd)) return;
 
         await sendTargetsPerItem(accountId, cur2);
         afterSendUpdate(accountId, id);
       });
-    } catch (e) {
-      log(accountId, "ERROR", `Job error id=${id}`, errToStr(e));
+      return;
     }
-  });
 
-  acc.jobs[id] = job;
-  log(accountId, "INFO", `Scheduled job`, `id=${id} type=${repeatType}`);
+    enqueueSend(accountId, async () => {
+      const idx2 = acc.messages.findIndex((m) => m.id === id);
+      if (idx2 === -1) return;
+      const cur2 = acc.messages[idx2];
+
+      const ok = await waitUntilReady(accountId, 60_000);
+      if (!ok) {
+        log(accountId, "WARN", `Wait ready timeout before send -> skip`, `id=${id}`);
+        return;
+      }
+
+      await sendTargetsPerItem(accountId, cur2);
+      afterSendUpdate(accountId, id);
+    });
+  } catch (e) {
+    log(accountId, "ERROR", `Job error id=${id}`, errToStr(e));
+  }
+}
+
+async function runTickInterval(accountId, id, everyMs) {
+  const acc = ensureAccount(accountId);
+
+  try {
+    log(accountId, "DEBUG", `Tick INTERVAL job id=${id}`);
+
+    const idx = acc.messages.findIndex((m) => m.id === id);
+    if (idx === -1) {
+      delete acc.jobs[id];
+      log(accountId, "WARN", `Interval tick but item missing -> cancel`, `id=${id}`);
+      return;
+    }
+    const current = acc.messages[idx];
+
+    // until
+    if (current.repeatUntilISO && isValidDateString(current.repeatUntilISO)) {
+      if (Date.now() > new Date(current.repeatUntilISO).getTime()) {
+        try { acc.jobs[id]?.cancel(); } catch {}
+        delete acc.jobs[id];
+        acc.messages.splice(idx, 1);
+        saveMessages(accountId);
+        log(accountId, "INFO", `RepeatUntil passed -> removed`, `id=${id}`);
+        return;
+      }
+    }
+
+    // count
+    if (typeof current.remainingCount === "number" && current.remainingCount <= 0) {
+      try { acc.jobs[id]?.cancel(); } catch {}
+      delete acc.jobs[id];
+      acc.messages.splice(idx, 1);
+      saveMessages(accountId);
+      log(accountId, "INFO", `RemainingCount <=0 -> removed`, `id=${id}`);
+      return;
+    }
+
+    // kalau belum ready, geser nextRun agar tidak ngebut
+    if (!acc.ready) {
+      log(accountId, "WARN", `INTERVAL tick but NOT READY -> postpone`, `id=${id}`);
+      current.nextRunISO = new Date(Date.now() + everyMs).toISOString();
+      saveMessages(accountId);
+      scheduleOne(accountId, current);
+      return;
+    }
+
+    // window check
+    const now = new Date();
+    if (!isNowInWindow(now, current.windowStart, current.windowEnd)) {
+      const waitMs = msUntilWindowStart(now, current.windowStart, current.windowEnd);
+      log(accountId, "DEBUG", `Outside window -> delay send`, `id=${id} waitMs=${waitMs}`);
+
+      enqueueSend(accountId, async () => {
+        const idx2 = acc.messages.findIndex((m) => m.id === id);
+        if (idx2 === -1) return;
+        const cur2 = acc.messages[idx2];
+
+        if (waitMs > 0) await sleep(waitMs);
+        const ok = await waitUntilReady(accountId, 60_000);
+        if (!ok) return;
+
+        const now2 = new Date();
+        if (!isNowInWindow(now2, cur2.windowStart, cur2.windowEnd)) return;
+
+        await sendTargetsPerItem(accountId, cur2);
+        afterSendUpdate(accountId, id);
+      });
+    } else {
+      enqueueSend(accountId, async () => {
+        const idx2 = acc.messages.findIndex((m) => m.id === id);
+        if (idx2 === -1) return;
+        const cur2 = acc.messages[idx2];
+
+        const ok = await waitUntilReady(accountId, 60_000);
+        if (!ok) return;
+
+        await sendTargetsPerItem(accountId, cur2);
+        afterSendUpdate(accountId, id);
+      });
+    }
+
+    // schedule NEXT RUN (persist)
+    const stillThere = acc.messages.find((m) => m.id === id);
+    if (!stillThere) return;
+
+    stillThere.nextRunISO = new Date(Date.now() + everyMs).toISOString();
+    saveMessages(accountId);
+    scheduleOne(accountId, stillThere);
+  } catch (e) {
+    log(accountId, "ERROR", `INTERVAL job error id=${id}`, errToStr(e));
+    const idx3 = acc.messages.findIndex((m) => m.id === id);
+    if (idx3 !== -1) {
+      acc.messages[idx3].nextRunISO = new Date(Date.now() + everyMs).toISOString();
+      saveMessages(accountId);
+      scheduleOne(accountId, acc.messages[idx3]);
+    }
+  }
 }
 
 function rescheduleAll(accountId) {
@@ -663,6 +862,11 @@ function rescheduleAll(accountId) {
     }
     if (m && Array.isArray(m.targets) && !m.targetsText) {
       m.targetsText = m.targets.map((x) => `${x.target} | ${x.message}`).join("\n");
+    }
+    // pastikan field nextRunISO kalau interval
+    if (m && String(m.repeatType || "").startsWith("interval_") && !m.nextRunISO) {
+      // akan dihitung saat scheduleOne dipanggil
+      m.nextRunISO = undefined;
     }
   }
 
@@ -685,7 +889,12 @@ app.post("/accounts/:accountId/init", (req, res) => {
   res.json({ ok: true, accountId });
 });
 
-app.get("/accounts", (req, res) => res.json(Object.keys(accounts)));
+app.get("/accounts", (req, res) => {
+  const mem = Object.keys(accounts);
+  const disk = listAccountIdsFromDisk();
+  const all = Array.from(new Set([...disk, ...mem]));
+  res.json(all);
+});
 
 app.get("/accounts/:accountId/status", (req, res) => {
   const acc = ensureAccount(req.params.accountId);
@@ -870,11 +1079,14 @@ app.post("/accounts/:accountId/messages", (req, res) => {
     gapSeconds: gap,
     randomDelayMinSeconds: rMin,
     randomDelayMaxSeconds: rMax,
+    // ✅ interval persistence
+    nextRunISO: undefined,
   };
 
   acc.messages.push(item);
   saveMessages(accountId);
-  if (acc.ready) scheduleOne(accountId, item);
+  // schedule walaupun belum ready -> interval nextRun bisa tersimpan
+  scheduleOne(accountId, item);
 
   updateRecent(accountId, item.targetsText, item.defaultMessage);
 
@@ -926,6 +1138,8 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
     cur.repeatType = rt;
 
     if (!rt.startsWith("interval_")) cur.intervalMinutes = undefined;
+    // reset nextRunISO biar hitung ulang
+    cur.nextRunISO = undefined;
   }
 
   if (patch.intervalMinutes !== undefined) {
@@ -934,6 +1148,7 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
       const n = Number(patch.intervalMinutes);
       if (!Number.isFinite(n) || n < 1) return res.status(400).json({ error: "interval value must be >= 1" });
       cur.intervalMinutes = Math.floor(n);
+      cur.nextRunISO = undefined;
     }
   }
 
@@ -976,12 +1191,10 @@ app.put("/accounts/:accountId/messages/:id", (req, res) => {
   saveMessages(accountId);
 
   if (acc.jobs[id]) {
-    try {
-      acc.jobs[id].cancel();
-    } catch {}
+    try { acc.jobs[id].cancel(); } catch {}
     delete acc.jobs[id];
   }
-  if (acc.ready) scheduleOne(accountId, cur);
+  scheduleOne(accountId, cur);
 
   updateRecent(accountId, cur.targetsText || "", cur.defaultMessage || "");
 
@@ -998,9 +1211,7 @@ app.delete("/accounts/:accountId/messages/:id", (req, res) => {
   if (idx === -1) return res.status(404).json({ error: "not found" });
 
   if (acc.jobs[id]) {
-    try {
-      acc.jobs[id].cancel();
-    } catch {}
+    try { acc.jobs[id].cancel(); } catch {}
     delete acc.jobs[id];
   }
 
@@ -1018,10 +1229,9 @@ app.post("/accounts/:accountId/logout", async (req, res) => {
 
   try {
     cancelAllJobs(acc);
-    try {
-      await acc.client.logout();
-    } catch {}
+    try { await acc.client.logout(); } catch {}
 
+    // hapus session (supaya scan QR ulang)
     removeDirSafe(accountSessionDir(accountId));
 
     acc.ready = false;
@@ -1043,22 +1253,14 @@ app.delete("/accounts/:accountId", async (req, res) => {
   try {
     if (acc) {
       cancelAllJobs(acc);
-      try {
-        await acc.client.destroy();
-      } catch {}
-      try {
-        await acc.client.logout();
-      } catch {}
+      try { await acc.client.destroy(); } catch {}
+      try { await acc.client.logout(); } catch {}
     }
 
     removeDirSafe(accountSessionDir(accountId));
 
-    try {
-      fs.unlinkSync(path.join(DATA_DIR, `scheduledMessages.${accountId}.json`));
-    } catch {}
-    try {
-      fs.unlinkSync(recentFile(accountId));
-    } catch {}
+    try { fs.unlinkSync(path.join(DATA_DIR, `scheduledMessages.${accountId}.json`)); } catch {}
+    try { fs.unlinkSync(recentFile(accountId)); } catch {}
 
     delete accounts[accountId];
 
@@ -1083,4 +1285,13 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
   console.log(`UI: http://IP:${PORT}/`);
   console.log(`Chromium: ${chromePath || "puppeteer-bundled"}`);
+
+  // ✅ server hidup dulu, lalu bootstrap WA (biar port pasti kebuka)
+  setTimeout(() => {
+    try {
+      bootstrapAccountsOnStart();
+    } catch (e) {
+      console.log("[BOOT] bootstrap failed:", errToStr(e));
+    }
+  }, 1500);
 });
