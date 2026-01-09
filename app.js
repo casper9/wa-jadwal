@@ -6,7 +6,7 @@
  * + LOGGING: file logs per account + endpoint /accounts/:accountId/logs + tampilkan di index.html
  */
 
-process.env.TZ = process.env.TZ || "Asia/Makassar"; // ganti ke "Asia/Jakarta" jika perlu
+process.env.TZ = process.env.TZ || "Asia/Jakarta"; // ganti ke "Asia/Jakarta" jika perlu
 
 const express = require("express");
 const fs = require("fs");
